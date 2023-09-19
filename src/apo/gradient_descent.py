@@ -1,7 +1,14 @@
+import asyncio
 import json
 import os
 
+from asyncio import Semaphore
+from typing import Dict
+from typing import List
+
+import evaluate
 import openai
+import pandas as pd
 
 from dotenv import load_dotenv
 
@@ -86,3 +93,97 @@ async def edit_prompt_with_gradients(
     messages = [edit_prompt.to_prompt()]
     response = await llm.generate(messages=messages, **openai_kwargs)
     return response["content"]
+
+
+async def run_prompt(semaphore: Semaphore, prompt: MessageTemplate, prompt_args: Dict, **openai_kwargs) -> str:
+    """Asynchronously evaluate a MessageTemplate prompt and return the output"""
+    async with semaphore:
+        prompt.format_message(**prompt_args)
+        messages = [prompt.to_prompt()]
+        response = await llm.generate(messages=messages, **openai_kwargs)
+        return response["content"]
+
+
+def compute_accuracy(predictions: pd.Series, labels: pd.Series) -> float:
+    """Compute accuracy of predictions"""
+    return (predictions == labels).sum() / len(predictions)
+
+
+def evaluate_predictions(predictions: List, labels: List, metric: str) -> float:
+    """
+    Evaluate the model's predictions using various metrics.
+
+    Parameters:
+    -----------
+    predictions : pd.Series
+        Series object containing the model's predictions.
+
+    labels : pd.Series
+        Series object containing the ground-truth labels.
+
+    metric : str
+        The type of metric to use for evaluation. Supported types are "accuracy", "f1", "recall", "rouge", and "bleu".
+
+    Returns:
+    --------
+    result : float or dict
+        The calculated metric value. For some metrics like 'rouge', a dictionary of values will be returned.
+    """
+
+    # Map metric names to metric functions
+    metric_fn = evaluate.load(metric)
+
+    # Compute the metric
+    if metric in ["accuracy", "f1", "recall"]:
+        result = metric_fn.compute(predictions=predictions, references=labels)
+    elif metric == "rouge":
+        result = metric_fn.compute(
+            predictions=predictions, references=labels, rouge_types=["rouge1", "rouge2", "rougeL"]
+        )
+    elif metric == "bleu":
+        result = metric_fn.compute(predictions=[predictions], references=[[labels]])
+    else:
+        raise ValueError(f"Unsupported metric: {metric}")
+
+    return result
+
+
+async def evaluate_prompt(
+    prompt: MessageTemplate,
+    data: pd.DataFrame,
+    input_cols: List,
+    label_col: str = "label",
+    concurrency: int = 10,
+    metric: str = "accuracy",
+    label_mapping: Dict = None,
+    **openai_kwargs,
+) -> float:
+    """
+    Evaluate a MessageTemplate prompt using a given dataset.
+
+    Parameters:
+    -----------
+    prompt : MessageTemplate
+        The MessageTemplate object to evaluate.
+
+    data : pd.DataFrame
+        The dataset to use for evaluation.
+
+    input_cols : List
+        The list of input columns to use for evaluation, only keep the columns that are required for the prompt.
+
+    label_col : str
+        The name of the column containing the ground-truth labels.
+    """
+
+    inputs = data[input_cols].to_dict("records")
+
+    semaphore = asyncio.Semaphore(concurrency)
+    tasks = [run_prompt(semaphore, prompt, prompt_input, **openai_kwargs) for prompt_input in inputs]
+
+    results = await asyncio.gather(*tasks)
+
+    if label_mapping is not None:
+        results = [label_mapping[result] for result in results]
+
+    return evaluate_predictions(results, data[label_col].tolist(), metric)
